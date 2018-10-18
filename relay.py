@@ -64,6 +64,7 @@ def main():
             block = merkle_proof.block_header(w3_block)
             raw_txn = bridge_contract.submit_block(bytes_to_int(block.hash), rlp.encode(block))
             raw_txn['nonce'] = web3_to.eth.getTransactionCount(privtoaddr(settings.PRIVATE_KEY))
+            raw_txn['gas'] = 200000
             signed_txn = web3_to.eth.account.signTransaction(raw_txn, private_key=settings.PRIVATE_KEY)
             txn_hash = encode_hex(web3_to.eth.sendRawTransaction(signed_txn.rawTransaction))
             txn_info = web3_to.eth.getTransaction(txn_hash)
