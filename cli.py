@@ -10,9 +10,9 @@ from web3 import Web3, HTTPProvider
 from web3.middleware import geth_poa_middleware
 
 import settings
-from merkle_proof import generate_proof_blob_from_jsonrpc_using_number, transaction
+from merkle_proof import generate_proof_blob_from_jsonrpc_using_number, transaction, \
+    generate_receipt_proof_blob_from_jsonrpc, receipt
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -47,7 +47,7 @@ class ETHLockingContract:
     def unlock(self, tx_value: bytes, block_hash: int, tx_path: bytes, tx_parent_nodes: bytes,
                rec_value: bytes, rec_path: bytes, rec_parent_nodes: bytes):
         return self.contract.functions.unlock(tx_value, block_hash, tx_path, tx_parent_nodes,
-                                              rec_value, rec_path, rec_parent_nodes)
+                                              rec_value, rec_path, rec_parent_nodes).buildTransaction()
 
 
 class ETHTokenContract:
@@ -59,7 +59,7 @@ class ETHTokenContract:
         return self.contract.functions.mint(value, block_hash, path, parent_nodes).buildTransaction()
 
     def burn(self, value: int, eth_addr: str):
-        return self.contract.functions.burn(value, eth_addr).buildTransaction()
+        return self.contract.functions.burn(value, eth_addr).buildTransaction({'gas': 200000})
 
 
 def send_txn(raw_txn, address, private_key, web3):
@@ -123,26 +123,31 @@ def burn(amount: float):
     private_key = settings.PRIVATE_KEY
     address = privtoaddr(private_key)
 
-    eth_locking_contract = ETHLockingContract(from_network['ethLockingAddress'], web3_from)
-    eth_token_contract = ETHTokenContract(to_network['ethTokenAddress'], web3_to)
+    eth_locking_contract = ETHLockingContract(to_network['ethLockingAddress'], web3_to)
+    eth_token_contract = ETHTokenContract(from_network['ethTokenAddress'], web3_from)
 
     raw_txn = eth_token_contract.burn(to_wei(amount, 'ether'), address)
-    txn_hash = send_txn(raw_txn, address, private_key, web3_to)
-    txn_info = wait_for_txn(txn_hash, web3_to)
+    txn_hash = send_txn(raw_txn, address, private_key, web3_from)
+    txn_hash = '0x261c9dabfa19dc594763f72a0e0b0d53b5045bad167e83b5569b7b4f071eef76'
+    txn_info = wait_for_txn(txn_hash, web3_from)
+    txn_receipt = web3_from.eth.getTransactionReceipt(txn_hash)
     logger.info('Successfully burned {} tokens in txn {}'.format(amount, txn_hash))
 
     proof_blob = generate_proof_blob_from_jsonrpc_using_number(
-        to_network['url'], txn_info.blockNumber, txn_info.transactionIndex)
+        from_network['url'], txn_info.blockNumber, txn_info.transactionIndex)
     decoded_proof_blob = rlp.decode(proof_blob)
+    receipt_proof_blob = generate_receipt_proof_blob_from_jsonrpc(
+        web3_from, txn_info.blockNumber, txn_info.transactionIndex)
+    decoded_receipt_proof_blob = rlp.decode(receipt_proof_blob)
     raw_txn = eth_locking_contract.unlock(rlp.encode(transaction(txn_info)),
                                           bytes_to_int(txn_info.blockHash),
                                           decoded_proof_blob[3],
                                           rlp.encode(decoded_proof_blob[5]),
-                                          _,  # TODO
-                                          _,  # TODO
-                                          _)  # TODO
-    txn_hash = send_txn(raw_txn, address, private_key, web3_from)
-    txn_info = wait_for_txn(txn_hash, web3_from)
+                                          rlp.encode(receipt(txn_receipt)),
+                                          decoded_receipt_proof_blob[3],
+                                          rlp.encode(decoded_receipt_proof_blob[5]))
+    txn_hash = send_txn(raw_txn, address, private_key, web3_to)
+    txn_info = wait_for_txn(txn_hash, web3_to)
     logger.info('Successfully unlocked {} ETH in txn {}'.format(amount, txn_hash))
 
 
@@ -154,7 +159,6 @@ def main():
     if args.lock:
         lock(args.lock)
     else:
-        raise NotImplementedError
         burn(args.burn)
 
 

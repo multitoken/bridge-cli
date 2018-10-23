@@ -3,7 +3,8 @@ import json
 import logging
 
 import requests
-from ethereum import block, transactions, utils
+from ethereum import block, messages, transactions, utils
+from ethereum.messages import Log
 from trie import HexaryTrie
 from trie.utils.nibbles import bytes_to_nibbles
 from trie.utils.nodes import *
@@ -48,6 +49,24 @@ def rec_bin(x):
         return 0
 
 
+# Taken from
+# https://github.com/ethereum/wiki/wiki/Patricia-Tree#specification-compact-encoding-of-hex-sequence-with-optional-terminator
+def compact_encode(hexarray):
+    term = 1 if hexarray[-1] == 16 else 0
+    if term: hexarray = hexarray[:-1]
+    oddlen = len(hexarray) % 2
+    flags = 2 * term + oddlen
+    if oddlen:
+        hexarray = [flags] + hexarray
+    else:
+        hexarray = [flags] + [0] + hexarray
+    # hexarray now has an even length whose first nibble is the flags.
+    o = ''
+    for i in range(0,len(hexarray),2):
+        o += chr(16 * hexarray[i] + hexarray[i+1])
+    return o
+
+
 def normalize_bytes(data):
     if isinstance(data, str):
         if data.startswith('0x'):
@@ -78,7 +97,6 @@ def get_args():
 
 
 def block_header(block_dict: dict) -> block.BlockHeader:
-
     b = block.BlockHeader(
         normalize_bytes(block_dict['parentHash']),
         normalize_bytes(block_dict['sha3Uncles']),
@@ -92,7 +110,7 @@ def block_header(block_dict: dict) -> block.BlockHeader:
         utils.parse_as_int(block_dict['gasLimit']),
         utils.parse_as_int(block_dict['gasUsed']),
         utils.parse_as_int(block_dict['timestamp']),
-        normalize_bytes(block_dict['extraData'] if 'extraData' in block_dict else bl),
+        normalize_bytes(block_dict['extraData']),
         normalize_bytes(block_dict['mixHash']),
         normalize_bytes(block_dict['nonce']),
     )
@@ -116,6 +134,26 @@ def transaction(tx_dict: dict) -> transactions.Transaction:
     if normalize_bytes(tx_dict['hash']) != t.hash:
         raise ValueError("Tx hash does not match. Received invalid transaction?")
     return t
+
+
+def receipt(receipt_dict: dict) -> messages.Receipt:
+    logs = [Log(utils.normalize_address(l['address']), [utils.parse_as_int(t.hex()) for t in l['topics']],
+                utils.decode_hex(l['data']))
+            for l in receipt_dict['logs']]
+    root = receipt_dict.get('root')
+    if root:
+        state_root = normalize_bytes(root)
+    elif receipt_dict['status'] == 1:
+        state_root = bytes([1])
+    else:
+        state_root = bytes()
+    r = messages.Receipt(
+        state_root,
+        utils.parse_as_int(receipt_dict['cumulativeGasUsed']),
+        utils.bytes_to_int(normalize_bytes(receipt_dict['logsBloom'])),
+        logs,
+    )
+    return r
 
 
 def generate_proof(mpt, mpt_key_nibbles: bytes):
@@ -197,7 +235,33 @@ def generate_proof_blob(block_dict, tx_index):
         1,  # proof_type
         header,
         tx_index,
-        bytes(mpt_path),
+        compact_encode(mpt_path),
+        bytes(stack_indexes),
+        stack,
+    ])
+    return proof_blob
+
+
+def generate_receipt_proof_blob(web3, block_dict, tx_index):
+    header = block_header(block_dict)
+
+    mpt = HexaryTrie(db={})
+    for tx_dict in block_dict['transactions']:
+        key = rlp.encode(tx_dict['transactionIndex'])
+        tx_receipt = web3.eth.getTransactionReceipt(tx_dict['hash'])
+        mpt.set(key, rlp.encode(receipt(tx_receipt)))
+
+    if mpt.root_hash != normalize_bytes(block_dict['receiptsRoot']):
+        raise ValueError('Receipt trie root hash does not match')
+
+    mpt_key_nibbles = bytes_to_nibbles(rlp.encode(tx_index))
+    mpt_path, stack_indexes, stack = generate_proof(mpt, mpt_key_nibbles)
+
+    proof_blob = rlp.encode([
+        2,  # proof_type
+        header,
+        tx_index,
+        compact_encode(mpt_path),
         bytes(stack_indexes),
         stack,
     ])
@@ -236,6 +300,11 @@ def generate_proof_blob_from_jsonrpc_using_number(url, block_number, tx_index):
     r = requests.post(url, json=request)
     r.raise_for_status()
     return generate_proof_blob_from_jsonrpc_response(r.json(), tx_index)
+
+
+def generate_receipt_proof_blob_from_jsonrpc(web3, block_number, tx_index):
+    r = web3.eth.getBlock(block_number, True)
+    return generate_receipt_proof_blob(web3, r, tx_index)
 
 
 def main():
